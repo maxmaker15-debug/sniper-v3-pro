@@ -3,39 +3,6 @@ import config
 from datetime import datetime, timedelta
 import time
 
-# --- DATABASE INTELLIGENTE (SUPERFICI + STILI) ---
-# Qui mappiamo l'identità tennistica dei giocatori
-PLAYERS_DB = {
-    # FORMATO: "Nome": {"surfaces": [Superfici Preferite], "style": "SERVER" o "RETURNER" o "ALL-ROUND"}
-    
-    # --- I BOMBARDIERI (Big Servers) ---
-    # Strategia: Su campi veloci (Hard/Grass) tengono il servizio facile. 
-    # Se giocano contro non-specialisti, vincono spesso con handicap o tie-break.
-    "Hurkacz":   {"surfaces": ["Hard", "Grass"], "style": "SERVER"},
-    "Berrettini": {"surfaces": ["Grass", "Hard"], "style": "SERVER"},
-    "Tsitsipas": {"surfaces": ["Clay", "Hard"], "style": "SERVER"},
-    "Zverev":    {"surfaces": ["Hard", "Clay"], "style": "SERVER"},
-    "Bublik":    {"surfaces": ["Indoor Hard", "Grass"], "style": "SERVER"},
-    "Shelton":   {"surfaces": ["Hard"], "style": "SERVER"},
-    "Kyrgios":   {"surfaces": ["Grass", "Hard"], "style": "SERVER"},
-    "Struff":    {"surfaces": ["Clay", "Grass"], "style": "SERVER"},
-    
-    # --- I MURI DI GOMMA (Great Returners / Grinders) ---
-    # Strategia: Fanno impazzire i server se la palla rallenta. 
-    "Sinner":    {"surfaces": ["Hard", "Indoor Hard"], "style": "RETURNER"}, # Risponde benissimo
-    "Alcaraz":   {"surfaces": ["Clay", "Hard"], "style": "ALL-ROUND"},
-    "Djokovic":  {"surfaces": ["Hard", "Grass", "Clay"], "style": "RETURNER"}, # Miglior risposta storia
-    "Medvedev":  {"surfaces": ["Hard", "Indoor Hard"], "style": "RETURNER"}, # Muro da fondo
-    "De Minaur": {"surfaces": ["Hard", "Grass"], "style": "RETURNER"},
-    "Schwartzman": {"surfaces": ["Clay"], "style": "RETURNER"},
-    "Baez":      {"surfaces": ["Clay"], "style": "RETURNER"},
-    
-    # --- SPECIALISTI PURI TERRA (Soffrono sul veloce) ---
-    "Ruud":      {"surfaces": ["Clay"], "style": "ALL-ROUND"},
-    "Cerundolo": {"surfaces": ["Clay"], "style": "ALL-ROUND"},
-    "Etcheverry": {"surfaces": ["Clay"], "style": "ALL-ROUND"},
-}
-
 # --- UTILITIES ---
 def calculate_kelly(true_prob, decimal_odd, bankroll):
     if decimal_odd <= 1.01: return 0
@@ -54,9 +21,94 @@ def send_telegram(message):
         requests.get(url, params={"chat_id": config.TELEGRAM_CHAT_ID, "text": message})
     except: pass
 
+# --- FUNZIONE SPECIALE: PRELIEVO DATI ON-DEMAND ---
+def get_player_predictive_stats(player_id, surface_filter):
+    """
+    Scarica le statistiche REALI 2025 del giocatore solo quando serve.
+    Restituisce il 'Dominance Ratio' (Service% + Return%).
+    """
+    if not player_id: return None
+    
+    current_year = datetime.now().year
+    # Se siamo a inizio anno, potremmo voler guardare anche l'anno scorso
+    season = current_year 
+    
+    try:
+        headers = {'x-apisports-key': config.TENNIS_API_KEY}
+        url = f"https://api.tennis.api-sports.io/players/statistics"
+        params = {"season": season, "id": player_id}
+        
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code != 200: return None
+        
+        data = resp.json().get('response', [])
+        
+        total_points_won = 0
+        matches_count = 0
+        service_points_won_pct = 0
+        return_points_won_pct = 0
+        
+        # Cerchiamo le stats generali o filtrate per superficie
+        found_surface = False
+        
+        for stat_block in data:
+            # Se riusciamo a filtrare per superficie è meglio (es. Hard)
+            raw_surf = stat_block.get('surface', '').lower()
+            if surface_filter.lower() in raw_surf:
+                matches_count = stat_block.get('games', {}).get('appearences', 0)
+                if matches_count > 0:
+                    # Estrazione Dati Predittivi
+                    # Nota: L'API Free a volte ha dati parziali, usiamo Points Won
+                    # Calcoliamo una media pesata se possibile
+                    # Qui semplifichiamo usando i dati generici forniti
+                    # API-Sports free fornisce dati aggregati complessi, usiamo win% generico come proxy
+                    # se mancano i punti precisi
+                    
+                    # Logica Semplificata per API-Sports Structure:
+                    # Service Games Won %
+                    srv_games_won = stat_block.get('games', {}).get('service_games_won', 0)
+                    srv_games_total = stat_block.get('games', {}).get('service_games_played', 0)
+                    
+                    if srv_games_total > 0:
+                        service_points_won_pct = (srv_games_won / srv_games_total) * 100
+                    
+                    # Per la risposta è più difficile averlo diretto, usiamo break points converted
+                    # come proxy di aggressività
+                    bp_conv = stat_block.get('break_points', {}).get('converted', 0)
+                    bp_total = stat_block.get('break_points', {}).get('attempted', 0)
+                    if bp_total > 0:
+                        return_points_won_pct = (bp_conv / bp_total) * 100 # Questo è BP Conversion, non Return Points, ma è predittivo
+                    
+                    found_surface = True
+                    break
+        
+        # Se non troviamo la superficie specifica, prendiamo il dato "All" (totale)
+        if not found_surface and len(data) > 0:
+            stat_block = data[0]
+            srv_games_won = stat_block.get('games', {}).get('service_games_won', 0)
+            srv_games_total = stat_block.get('games', {}).get('service_games_played', 0)
+            if srv_games_total > 0:
+                service_points_won_pct = (srv_games_won / srv_games_total) * 100
+        
+        # CREAZIONE DEL DOMINANCE INDEX
+        # Service Hold % (Media ATP ~80%) + Break % (Media ATP ~20%) = 100
+        # Se un giocatore ha Hold 90% e Break 30% = 120 (MOSTRO)
+        dominance_index = service_points_won_pct + (return_points_won_pct / 2) # Pesiamo diversamente i BP
+        
+        return {
+            "Hold%": round(service_points_won_pct, 1),
+            "Break_Conv%": round(return_points_won_pct, 1),
+            "Dominance": round(dominance_index, 1),
+            "Matches": matches_count
+        }
+
+    except Exception as e:
+        print(f"Err Stats: {e}")
+        return None
+
 # --- MOTORE CALCIO (Invariato) ---
 def run_football_scan(bankroll):
-    print("⚽ Avvio Scansione Calcio...")
+    print("⚽ Scansione Calcio...")
     found_bets = []
     dates = [datetime.now().strftime("%Y-%m-%d"), (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")]
     for d in dates:
@@ -105,14 +157,15 @@ def run_football_scan(bankroll):
         except Exception: pass
     return found_bets
 
-# --- MOTORE TENNIS (V5 - STYLES & SURFACES) ---
+# --- MOTORE TENNIS PREDITTIVO (V7 - LIVE DATA MINING) ---
 def run_tennis_scan(bankroll):
-    print("🎾 Avvio Scansione Tennis V5 (Styles)...")
+    print("🎾 Scansione Tennis Predittivo (V7)...")
     found_bets = []
     
-    # 1. SCARICA CLASSIFICA E INFO TORNEO
+    # 1. MAPPING ID GIOCATORI
+    # Scarichiamo il programma e salviamo ID e Superficie
     today = datetime.now().strftime("%Y-%m-%d")
-    matches_info = {} 
+    players_map = {} # Nome -> {ID, Superficie}
     
     try:
         headers = {'x-apisports-key': config.TENNIS_API_KEY}
@@ -125,27 +178,31 @@ def run_tennis_scan(bankroll):
                 cat = g.get('tournament', {}).get('category', {}).get('name', '')
                 if 'ATP' not in cat and 'WTA' not in cat: continue
                 
-                # Info Superficie (Es. "Hard", "Clay")
-                # Normalizziamo le superfici
                 raw_surface = g.get('tournament', {}).get('surface', 'Unknown')
-                surface = "Hard"
+                surface = "Hard" # Default
                 if "Clay" in raw_surface: surface = "Clay"
                 elif "Grass" in raw_surface: surface = "Grass"
-                elif "Indoor" in raw_surface: surface = "Indoor Hard"
+                elif "Indoor" in raw_surface: surface = "Indoor"
                 
-                p1, p2 = g.get('players', [])[0], g.get('players', [])[1]
-                if not p1.get('rank') or not p2.get('rank'): continue
+                p1 = g.get('players', [])[0]
+                p2 = g.get('players', [])[1]
                 
-                matches_info[p1.get('name')] = {'rank': p1.get('rank'), 'opp_rank': p2.get('rank'), 'surface': surface}
-                matches_info[p2.get('name')] = {'rank': p2.get('rank'), 'opp_rank': p1.get('rank'), 'surface': surface}
-    except: pass
+                if p1.get('id') and p1.get('name'):
+                    players_map[p1.get('name')] = {'id': p1.get('id'), 'surface': surface, 'rank': p1.get('rank')}
+                if p2.get('id') and p2.get('name'):
+                    players_map[p2.get('name')] = {'id': p2.get('id'), 'surface': surface, 'rank': p2.get('rank')}
+                    
+    except Exception as e: 
+        print(f"Err Mapping: {e}")
+        return []
 
-    # 2. SCARICA QUOTE
+    # 2. SCANSIONE QUOTE (Il Trigger)
     try:
         resp = requests.get('https://api.the-odds-api.com/v4/sports', params={'apiKey': config.ODDS_API_KEY})
         leagues = [s for s in resp.json() if 'tennis' in s['key'].lower() and 'winner' not in s['key']]
         
-        for league in leagues:
+        # Limitiamo le leghe per non finire le chiamate
+        for league in leagues[:3]: 
             resp = requests.get(f'https://api.the-odds-api.com/v4/sports/{league["key"]}/odds', 
                               params={'apiKey': config.ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'oddsFormat': 'decimal'})
             if resp.status_code != 200: continue
@@ -153,8 +210,9 @@ def run_tennis_scan(bankroll):
             for ev in resp.json():
                 home, away = ev['home_team'], ev['away_team']
                 match_label = f"{home} vs {away}"
-                pinna, bf = {}, {}
                 
+                # Cerchiamo le quote
+                pinna, bf = {}, {}
                 for b in ev['bookmakers']:
                     if b['key'] == 'pinnacle': 
                         for o in b['markets'][0]['outcomes']: pinna[o['name']] = o['price']
@@ -168,64 +226,71 @@ def run_tennis_scan(bankroll):
                     if player not in bf: continue
                     q_bf, q_pinna = bf[player], pinna[player]
                     
-                    # 1. TRAP DETECTOR
-                    if q_pinna > 1.70: continue 
+                    # 1. FILTRO QUOTA INIZIALE (Non chiamare API se la quota fa schifo)
+                    trend_diff = (1 - (q_pinna / q_bf)) * 100
+                    if trend_diff < 0.5: continue # Se non c'è minimo valore, passa oltre
                     
-                    # 2. MATCH CON DATABASE
-                    ranking_advantage = 0
-                    current_surface = None
-                    quality_boost = False
-                    style_match = ""
-                    player_found = False
+                    # 2. IDENTIFICAZIONE GIOCATORE (Fuzzy Match)
+                    player_data = None
+                    opponent_name = away if player == home else home
+                    opponent_data = None
                     
-                    for api_name, data in matches_info.items():
-                        if player.split()[-1] in api_name: 
-                            ranking_advantage = data['opp_rank'] - data['rank']
-                            current_surface = data['surface']
-                            player_found = True
-                            break
+                    for api_name, data in players_map.items():
+                        if player.split()[-1] in api_name: player_data = data
+                        if opponent_name.split()[-1] in api_name: opponent_data = data
                     
-                    if player_found:
-                        if ranking_advantage < config.STRATEGY_TENNIS['MIN_RANK_DIFF']: continue
-                        
-                        # --- LOGICA SERVIZIO / RISPOSTA ---
-                        for db_name, db_data in PLAYERS_DB.items():
-                            if db_name in player:
-                                # A. È uno specialista della superficie?
-                                if current_surface in db_data['surfaces']:
-                                    quality_boost = True
-                                    style_match = "SPECIALIST"
-                                    
-                                    # B. È un SERVER su Veloce? (Boost Doppio)
-                                    if db_data['style'] == "SERVER" and current_surface in ["Hard", "Grass", "Indoor Hard"]:
-                                        style_match = "🚀 BIG SERVER"
-                    else:
-                        if q_pinna > 1.55: continue
+                    if not player_data: continue # Non abbiamo l'ID, non possiamo analizzare
+                    
+                    # 3. ON-DEMAND DATA MINING (Qui spendiamo la chiamata API)
+                    # Scarichiamo le stats solo se potenzialmente interessante
+                    print(f"   🔎 Analisi profonda per {player}...")
+                    
+                    p_stats = get_player_predictive_stats(player_data['id'], player_data['surface'])
+                    # Facoltativo: scaricare anche avversario, ma costa doppio.
+                    # Per ora ci basiamo sulla forza intrinseca del nostro cavallo.
+                    
+                    if not p_stats: continue # Dati non disponibili
+                    
+                    # 4. IL CALCOLO PREDITTIVO
+                    # Un giocatore solido deve tenere il servizio > 75%
+                    is_solid_server = p_stats['Hold%'] > 75.0
+                    dominance = p_stats['Dominance']
+                    
+                    # Rating Basato sui Dati
+                    rating = "⚪ NEUTRAL"
+                    predictive_boost = False
+                    
+                    if dominance > 100.0: # Giocatore Dominante
+                        rating = f"🚀 DOMINANT (Score {dominance})"
+                        predictive_boost = True
+                    elif p_stats['Hold%'] > 85.0 and player_data['surface'] in ['Grass', 'Indoor']:
+                        rating = f"🛡️ UNBREAKABLE ({p_stats['Hold%']}%)"
+                        predictive_boost = True
+                    elif dominance < 85.0:
+                        # Giocatore scarso, evitiamo anche se la quota è buona
+                        print(f"   ❌ Scartato {player}: Stats troppo basse ({dominance})")
+                        continue
 
-                    # 3. VALORE
+                    # 5. CALCOLO FINALE
                     prob_reale = (1/q_pinna) / margin
                     ev = (prob_reale * q_bf - 1) * 100
                     
-                    if ev >= config.STRATEGY_TENNIS['MIN_EDGE']:
+                    # Se i dati confermano la bontà, abbassiamo la soglia di EV richiesta
+                    min_edge_required = config.STRATEGY_TENNIS['MIN_EDGE']
+                    if predictive_boost: min_edge_required = 1.0 # Ci accontentiamo di meno margine se è forte
+                    
+                    if ev >= min_edge_required:
                         stake = calculate_kelly(prob_reale, q_bf, bankroll)
-                        
-                        # Rating Dinamico
-                        rating = "✅ SOLID"
-                        if quality_boost:
-                            rating = f"💎 {style_match}"
-                            stake = int(stake * 1.25) # +25% Stake per i match di stile favorevole
-                            if stake > config.STAKE_MAX: stake = config.STAKE_MAX
-                        
-                        if not quality_boost and ev < 3.0: continue
+                        if predictive_boost: stake = int(stake * 1.2) # Boost Stake
                         
                         if stake > 0:
-                            msg = f"🎾 TENNIS: {player}\nStyle: {style_match}\nQ: {q_bf} | EV: {ev:.1f}%\nStake: {stake}€"
+                            msg = f"🎾 PREDICTION: {player}\nStats: {rating}\nHold: {p_stats['Hold%']}% | Q: {q_bf}\nStake: {stake}€"
                             send_telegram(msg)
                             found_bets.append({
                                 "Sport": "TENNIS", "Data": ev['commence_time'], "Match": match_label,
                                 "Selezione": player, "Q_Betfair": q_bf, "Q_Reale": q_pinna,
                                 "Rating": rating, "Edge%": round(ev, 1), "Stake_Ready": stake, "Abbinata": False
                             })
-                            
-    except: pass
+
+    except Exception as e: print(f"Err Tennis V7: {e}")
     return found_bets
